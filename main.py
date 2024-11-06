@@ -70,6 +70,57 @@ def get_historical_data(client: Client, symbol: str, interval: str,
     except Exception as e:
         print(f"Error fetching historical data: {e}")
         return pd.DataFrame()
+def generate_trading_signal(k: float, d: float, rsi: float, 
+                          current_price: float, ma: float, 
+                          upper_bb: float, lower_bb: float,
+                          trend_strength: float) -> dict:
+    """
+    Generate trading signals based on technical indicators
+    Strategy combines KDJ crossover, RSI, and Bollinger Bands
+    """
+    signal = {
+        'action': 'NEUTRAL',
+        'confidence': 0,
+        'reason': ''
+    }
+    
+    # Strong trend condition
+    if trend_strength < Config.MIN_TREND_STRENGTH:
+        return signal
+    
+    # Buy Conditions
+    if (k > d and  # KDJ bullish crossover
+        rsi < 70 and  # Not overbought
+        current_price < lower_bb and  # Price below lower BB
+        current_price < ma):  # Price below MA
+        
+        signal['action'] = 'BUY'
+        signal['confidence'] = min((70 - rsi) / 30 * trend_strength, 1)
+        signal['reason'] = 'Bullish KDJ crossover with oversold RSI'
+        
+    # Sell Conditions    
+    elif (k < d and  # KDJ bearish crossover
+          rsi > 30 and  # Not oversold
+          current_price > upper_bb and  # Price above upper BB
+          current_price > ma):  # Price above MA
+          
+        signal['action'] = 'SELL'
+        signal['confidence'] = min((rsi - 30) / 30 * trend_strength, 1)
+        signal['reason'] = 'Bearish KDJ crossover with overbought RSI'
+        
+    return signal
+
+def calculate_position_size(balance: float, current_price: float, 
+                          signal_confidence: float) -> float:
+    """
+    Calculate position size based on:
+    - Account balance
+    - Risk percentage
+    - Signal confidence
+    """
+    risk_amount = balance * Config.RISK_PERCENTAGE * signal_confidence
+    position_size = risk_amount / (current_price * Config.STOP_LOSS)
+    return position_size
 
 def get_account_balance(client: Client) -> dict:
     """Get spot account balances"""
@@ -89,6 +140,57 @@ def get_account_balance(client: Client) -> dict:
     except Exception as e:
         print(f"Error getting account balance: {e}")
         return {}
+
+def place_trade(client: Client, signal: dict, current_price: float, 
+                balance: float) -> dict:
+    """Execute trade based on signal"""
+    try:
+        # Calculate position size
+        usdt_balance = balance.get('USDT', {}).get('free', 0)
+        position_size = calculate_position_size(
+            usdt_balance, 
+            current_price,
+            signal['confidence']
+        )
+        
+        if position_size * current_price < 10:  # Minimum order size check
+            return None
+            
+        # Place market order
+        order = place_order(
+            client,
+            Config.SYMBOL,
+            signal['action'],
+            position_size
+        )
+        
+        if order:
+            # Calculate stop-loss and take-profit prices
+            stop_loss = current_price * (1 - Config.STOP_LOSS) if signal['action'] == 'BUY' \
+                       else current_price * (1 + Config.STOP_LOSS)
+                       
+            take_profit = current_price * (1 + Config.PROFIT_TARGET) if signal['action'] == 'BUY' \
+                         else current_price * (1 - Config.PROFIT_TARGET)
+            
+            # Place stop-loss order
+            stop_loss_order = client.create_order(
+                symbol=Config.SYMBOL,
+                side='SELL' if signal['action'] == 'BUY' else 'BUY',
+                type=ORDER_TYPE_STOP_LOSS_LIMIT,
+                quantity=position_size,
+                price=stop_loss,
+                stopPrice=stop_loss
+            )
+            
+            return {
+                'entry_order': order,
+                'stop_loss': stop_loss_order,
+                'take_profit': take_profit
+            }
+            
+    except Exception as e:
+        print(f"Error placing trade: {e}")
+        return None
 
 def place_order(client: Client, symbol: str, side: str, quantity: float):
     """Place spot market order"""
@@ -139,6 +241,8 @@ def run_live_trading():
         indicators = TechnicalIndicators()
         start_time = (datetime.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
         
+        active_position = False
+        
         while True:
             try:
                 # Get latest data
@@ -154,34 +258,47 @@ def run_live_trading():
                     time.sleep(10)
                     continue
                 
-                # Get account balances
+                # Get market data
                 balances = get_account_balance(client)
-                
-                # Get current price
                 current_price = get_current_price(client, Config.SYMBOL)
                 current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                
-                print(f"\nTime: {current_time}")
-                print(f"Current {Config.SYMBOL} price: ${current_price:,.2f}")
-                print("\nBalances:")
-                for asset, balance in balances.items():
-                    print(f"{asset}: {balance['free']} (Free) / {balance['locked']} (Locked)")
                 
                 # Calculate indicators
                 k, d, trend_strength = indicators.calculate_KDJ(df)
                 rsi = indicators.calculate_RSI(df)
                 ma, upper_bb, lower_bb = indicators.calculate_bollinger_bands(df)
                 
-                print("\n=== Indicator Values ===")
+                # Generate trading signal
+                signal = generate_trading_signal(
+                    k, d, rsi, current_price, ma, 
+                    upper_bb, lower_bb, trend_strength
+                )
+                
+                # Print market information
+                print(f"\nTime: {current_time}")
+                print(f"Price: ${current_price:,.2f}")
+                print(f"Signal: {signal['action']} (Confidence: {signal['confidence']:.2f})")
+                print(f"Reason: {signal['reason']}")
+                print("\nIndicators:")
                 print(f"KDJ - K: {k:.2f}, D: {d:.2f}")
                 print(f"RSI: {rsi:.2f}")
-                print(f"MA: {ma:.2f}")
+                print(f"BB: {lower_bb:.2f} < {ma:.2f} < {upper_bb:.2f}")
                 
-                time.sleep(10)
+                # Execute trading logic
+                if not active_position and signal['action'] in ['BUY', 'SELL']:
+                    trade_result = place_trade(client, signal, current_price, balances)
+                    if trade_result:
+                        active_position = True
+                        print(f"\nExecuted {signal['action']} trade:")
+                        print(f"Entry Price: ${current_price:,.2f}")
+                        print(f"Stop Loss: ${trade_result['stop_loss']:,.2f}")
+                        print(f"Take Profit: ${trade_result['take_profit']:,.2f}")
+                
+                time.sleep(Config.INTERVAL)
                 
             except Exception as e:
                 print(f"Error in trading loop: {e}")
-                time.sleep(10)
+                time.sleep(Config.INTERVAL)
                 
     except Exception as e:
         print(f"Critical error in trading: {e}")
